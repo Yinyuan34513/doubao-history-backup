@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         豆包历史备份器
 // @namespace    https://github.com/Yinyuan34513/doubao-history-backup
-// @version      1.2.0
+// @version      1.2.1
 // @description  拦截豆包历史 API 并自动翻页刷新，IndexedDB 缓存增量同步（不重复抓已抓齐会话），导出 history/<会话名>/main.md ZIP
 // @author       Yinyuan34513
 // @match        https://doubao.com/*
@@ -20,7 +20,8 @@
   const LIST_LIMIT = 50;               // recent_conv 每页会话数
   const CHAIN_LIMIT = 20;              // chain/single 每页消息数
   const ANCHOR_MAX = 9007199254740991; // 初始 anchor_index (MAX_SAFE_INTEGER)
-  const CONV_DELAY = 150;              // 会话同步间隔（防限流）
+  const CONV_DELAY = 150;              // 单个 worker 的会话间隔（防限流）
+  const MSG_CONCURRENCY = 3;           // 并发抓消息的 worker 数（提速 ~3x）
 
   // 需要拦截/主动调用的历史相关 API（pathname 后缀匹配）
   const HISTORY_PATHS = [
@@ -610,20 +611,26 @@
       idbPutAll('convs', convs.map(serializeConv));        // 列表元数据批量落库
       const queue = convs.filter(needsSync).sort((a, b) => b.update - a.update);
       log(`列表同步完成，共 ${convs.length} 个会话，待抓取消息 ${queue.length} 个`);
-      let done = 0;
-      for (const c of queue) {
-        setStatus(`抓取消息 ${++done}/${queue.length}`);
-        try {
-          const up = c.update;                     // 抓取前的 update_time 快照
-          const n = await fetchChain(c);
-          c.syncedTo = up;                         // 无论抓到多少条（含 0 条）都标记已抓齐
-          saveConv(c);
-          log(`✓ ${c.name || c.id} (${n} 条)`);
-        } catch (e) {
-          log(`✗ ${c.name || c.id}: ${e.message}`);   // 失败不落 syncedTo，下轮自动重试
+      // 并发 worker 池：每个 worker 独立顺序抓，worker 之间并行（提速且各自保持间隔防限流）
+      let cursor = 0, done = 0;
+      const total = queue.length;
+      const worker = async () => {
+        while (cursor < total) {
+          const c = queue[cursor++];
+          setStatus(`抓取消息 ${++done}/${total}`);
+          try {
+            const up = c.update;                     // 抓取前的 update_time 快照
+            const n = await fetchChain(c);
+            c.syncedTo = up;                         // 无论抓到多少条（含 0 条）都标记已抓齐
+            saveConv(c);
+            log(`✓ ${c.name || c.id} (${n} 条)`);
+          } catch (e) {
+            log(`✗ ${c.name || c.id}: ${e.message}`);   // 失败不落 syncedTo，下轮自动重试
+          }
+          await delay(CONV_DELAY);
         }
-        await delay(CONV_DELAY);
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(MSG_CONCURRENCY, total) }, worker));
       renderList();
       const totalMsgs = [...state.msgs.values()].reduce((s, m) => s + m.size, 0);
       setStatus('已同步');

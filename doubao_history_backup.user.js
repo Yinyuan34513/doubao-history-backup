@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         豆包历史备份器
 // @namespace    https://github.com/Yinyuan34513/doubao-history-backup
-// @version      1.2.2
-// @description  拦截豆包历史 API 并自动翻页刷新，IndexedDB 缓存增量同步（不重复抓已抓齐会话），导出 history/<会话名>/main.md ZIP
+// @version      1.2.3
+// @description  拦截豆包历史 API 并自动翻页刷新，IndexedDB 缓存增量同步（不重复抓已抓齐会话，服务端异常会话失败预算跳过），导出 history/<会话名>/main.md ZIP
 // @author       Yinyuan34513
 // @match        https://doubao.com/*
 // @match        https://www.doubao.com/*
 // @run-at       document-start
+// @noframes     只在顶层窗口运行（避免 drive-iframe 等子框架重复起一套轮询/日志/IDB 写入）
 // @grant        GM_addStyle
 // @grant        unsafeWindow
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js
@@ -20,8 +21,9 @@
   const LIST_LIMIT = 50;               // recent_conv 每页会话数
   const CHAIN_LIMIT = 20;              // chain/single 每页消息数
   const ANCHOR_MAX = 9007199254740991; // 初始 anchor_index (MAX_SAFE_INTEGER)
-  const CONV_DELAY = 6;              // 单个 worker 的会话间隔（防限流）
-  const MSG_CONCURRENCY = 90;          // 并发抓消息 worker 数（实测豆包不限流，直接拉满；要改数值就改这里）
+  const CONV_DELAY = 6;               // 单个 worker 的会话间隔（防限流）
+  const MSG_CONCURRENCY = 90;         // 并发抓消息 worker 数（实测豆包不限流，直接拉满；要改数值就改这里）
+  const MAX_CONV_FAILS = 3;           // 失败预算：同一会话连续失败 N 次后暂停重试（会话有更新时自动恢复）
 
   // 需要拦截/主动调用的历史相关 API（pathname 后缀匹配）
   const HISTORY_PATHS = [
@@ -91,6 +93,7 @@
     convs: new Map(),             // id -> {id,name,type,create,update,syncedTo}
     msgs: new Map(),              // id -> Map(message_id -> message)
     syncing: false,
+    exporting: false,               // 导出进行中标记（防重复点击）
     listPages: 0,                 // 已翻列表页数（响应无总数，翻到 has_more=false 为止）
     cacheLoaded: false            // IndexedDB 缓存是否已载入
   };
@@ -152,7 +155,8 @@
   }
 
   function serializeConv(c) {
-    return { id: c.id, name: c.name, type: c.type, create: c.create, update: c.update, syncedTo: c.syncedTo || 0 };
+    return { id: c.id, name: c.name, type: c.type, create: c.create, update: c.update, syncedTo: c.syncedTo || 0,
+             fails: c.fails || 0, failUpd: c.failUpd || 0 };
   }
 
   function saveConv(c) { return idbPut('convs', serializeConv(c)); }
@@ -176,7 +180,8 @@
         if (!c || !c.id) continue;
         state.convs.set(c.id, {
           id: c.id, name: c.name || '', type: c.type || 3,
-          create: Number(c.create) || 0, update: Number(c.update) || 0, syncedTo: Number(c.syncedTo) || 0
+          create: Number(c.create) || 0, update: Number(c.update) || 0, syncedTo: Number(c.syncedTo) || 0,
+          fails: Number(c.fails) || 0, failUpd: Number(c.failUpd) || 0   // 失败预算（跨刷新保留）
         });
         nConv++;
       }
@@ -452,6 +457,11 @@
     }
   }
 
+  // 同源子框架（如 drive-iframe）里不再重复启动整套逻辑：
+  // 双实例会各开一套 60s 轮询 + 双份日志 + 双份 IDB 写入。单实例由 @noframes 保证
+  //（不能用 window.top 判断：TM 沙盒 iframe 与页面同源，会把顶层实例也误杀）。
+  // 页面流量拦截对子 frame 不生效也没关系 —— runSync 主动同步是主路径，URL 学习有 fallbackQuery 兜底。
+
   patchWindow(W);
 
   // ============================ 主动同步 ============================
@@ -586,8 +596,12 @@
   function needsSync(c) {
     // 已抓齐（syncedTo 落位）且 update_time 没有变化的会话一律跳过 —— 不重复抓
     const s = Number(c.syncedTo || 0);
-    if (s <= 0) return true;                       // 从未抓齐（含空会话，抓完也会落 syncedTo）
-    return Number(c.update || 0) > s;              // 会话自上次抓取后有更新
+    const upd = Number(c.update || 0);
+    if (s > 0 && upd <= s) return false;             // 已抓齐且无更新
+    // 失败预算：同一会话连续失败达上限后跳过（服务端 712010702 之类永久异常，
+    // 否则每轮同步都重抓、日志刷屏）；会话一旦有新 update_time 则自动恢复重试
+    if (Number(c.fails || 0) >= MAX_CONV_FAILS && upd <= Number(c.failUpd || 0)) return false;
+    return true;
   }
 
   function setStatus(s) {
@@ -598,8 +612,9 @@
   async function runSync() {
     if (state.syncing) { log('同步进行中，跳过本次'); return; }
     state.syncing = true;
-    const btns = ['dbb-sync', 'dbb-export'].map((id) => document.getElementById(id));
-    btns.forEach((b) => b && (b.disabled = true));
+    // 只禁用"立即同步"；导出按钮保持可点（exportZip 会等待同步完成后再导出）
+    const btn = document.getElementById('dbb-sync');
+    if (btn) btn.disabled = true;
     try {
       await loadCache();                           // 先复用 IndexedDB 里的旧数据
       setStatus('同步会话列表…');
@@ -610,7 +625,10 @@
       if (state.nickname) saveNickname(state.nickname);
       idbPutAll('convs', convs.map(serializeConv));        // 列表元数据批量落库
       const queue = convs.filter(needsSync).sort((a, b) => b.update - a.update);
-      log(`列表同步完成，共 ${convs.length} 个会话，待抓取消息 ${queue.length} 个`);
+      const budgeted = convs.filter((c) =>
+        Number(c.fails || 0) >= MAX_CONV_FAILS && Number(c.update || 0) <= Number(c.failUpd || 0)).length;
+      log(`列表同步完成，共 ${convs.length} 个会话，待抓取消息 ${queue.length} 个` +
+          (budgeted ? `（另有 ${budgeted} 个连续失败已暂停重试）` : ''));
       // 并发 worker 池：每个 worker 独立顺序抓，worker 之间并行（提速且各自保持间隔防限流）
       let cursor = 0, done = 0;
       const total = queue.length;
@@ -622,10 +640,18 @@
             const up = c.update;                     // 抓取前的 update_time 快照
             const n = await fetchChain(c);
             c.syncedTo = up;                         // 无论抓到多少条（含 0 条）都标记已抓齐
+            if (c.fails) { c.fails = 0; c.failUpd = 0; }   // 成功即清零失败预算
             saveConv(c);
             log(`✓ ${c.name || c.id} (${n} 条)`);
           } catch (e) {
-            log(`✗ ${c.name || c.id}: ${e.message}`);   // 失败不落 syncedTo，下轮自动重试
+            // 失败预算：计数落库，达上限后 needsSync 跳过（会话有更新时自动恢复）；日志只报第一次
+            c.fails = Number(c.fails || 0) + 1;
+            c.failUpd = Number(c.update) || 0;
+            saveConv(c);
+            if (c.fails === 1) log(`✗ ${c.name || c.id}: ${e.message}`);
+            else if (c.fails >= MAX_CONV_FAILS) {
+              log(`⛔ ${c.name || c.id}: 连续失败 ${c.fails} 次，已暂停重试（会话更新后自动恢复）`);
+            }
           }
           await delay(CONV_DELAY);
         }
@@ -640,7 +666,7 @@
       log('同步失败: ' + e.message);
     } finally {
       state.syncing = false;
-      btns.forEach((b) => b && (b.disabled = false));
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -825,66 +851,102 @@
 
   // ============================ 导出 ============================
   async function exportZip() {
-    if (state.syncing) { log('同步进行中，请稍后再导出'); return; }
-    await runSync();
-    const nickname = state.nickname || 'User';
-    const convs = [...state.convs.values()]
-      .filter((c) => (state.msgs.get(c.id) || new Map()).size > 0)
-      .sort((a, b) => a.create - b.create);
-    if (!convs.length) { log('没有可导出的会话'); return; }
+    if (state.exporting) { log('导出进行中，请稍候'); return; }
+    state.exporting = true;
+    const exBtn = document.getElementById('dbb-export');
+    if (exBtn) exBtn.disabled = true;
+    const t0 = Date.now();
+    try {
+      log('开始导出…（JSZip: ' + (typeof JSZip !== 'undefined' ? '已加载' : '未加载→store 回退') + '）');
+      // 同步正在进行 → 等它完成再导出（不打断、不再无反馈地拒绝）
+      if (state.syncing) {
+        log('同步进行中，等待本次同步完成…');
+        const wait0 = Date.now();
+        while (state.syncing && Date.now() - wait0 < 5 * 60 * 1000) await delay(300);
+      }
+      setStatus('导出：同步数据…');
+      await runSync();
+      const nickname = state.nickname || 'User';
+      const convs = [...state.convs.values()]
+        .filter((c) => (state.msgs.get(c.id) || new Map()).size > 0)
+        .sort((a, b) => a.create - b.create);
+      if (!convs.length) { log('没有可导出的会话'); setStatus('导出：无可导出会话'); return; }
 
-    const files = [];
-    const used = new Set();
-    let msgTotal = 0;
-    for (const c of convs) {
-      let dir = sanitize(c.name, '会话_' + c.id);
-      let n = 2;
-      while (used.has(dir)) dir = `${sanitize(c.name, '会话_' + c.id)}_${n++}`;
-      used.add(dir);
-      const msgs = [...state.msgs.get(c.id).values()];
-      msgTotal += msgs.length;
-      files.push({
-        name: `${dir}/main.md`,
-        data: buildMd(c, msgs, nickname)
-      });
-    }
+      log(`导出：开始生成 Markdown（${convs.length} 个会话）…`);
+      const files = [];
+      const used = new Set();
+      let msgTotal = 0;
+      for (const c of convs) {
+        let dir = sanitize(c.name, '会话_' + c.id);
+        let n = 2;
+        while (used.has(dir)) dir = `${sanitize(c.name, '会话_' + c.id)}_${n++}`;
+        used.add(dir);
+        const msgs = [...state.msgs.get(c.id).values()];
+        msgTotal += msgs.length;
+        files.push({
+          name: `${dir}/main.md`,
+          data: buildMd(c, msgs, nickname)
+        });
+      }
+      log(`导出：Markdown 完毕（${msgTotal} 条消息），开始压缩…`);
 
-    let blob, zipKind;
-    if (typeof JSZip !== 'undefined') {
-      // JSZip：DEFLATE 压缩 + UTF-8 文件名
-      const zip = new JSZip();
-      const folder = zip.folder('history');
-      for (const f of files) folder.file(f.name, f.data);
-      blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
-      zipKind = 'JSZip/deflate';
-    } else {
-      blob = makeZip(files.map((f) => ({ name: 'history/' + f.name, data: enc.encode(f.data) })));
-      zipKind = 'store(回退)';
+      let blob, zipKind;
+      if (typeof JSZip !== 'undefined') {
+        // JSZip：DEFLATE 压缩 + UTF-8 文件名
+        const zip = new JSZip();
+        const folder = zip.folder('history');
+        for (const f of files) folder.file(f.name, f.data);
+        let nextPct = 20;
+        blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } },
+          (meta) => {
+            const p = Math.floor(meta.percent || 0);
+            if (p >= nextPct) { nextPct += 20; setStatus(`导出：压缩 ${p}%`); }
+          });
+        zipKind = 'JSZip/deflate';
+      } else {
+        blob = makeZip(files.map((f) => ({ name: 'history/' + f.name, data: enc.encode(f.data) })));
+        zipKind = 'store(回退)';
+      }
+      const ts = new Date();
+      const pad = (x) => String(x).padStart(2, '0');
+      const fname = `doubao-history-${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.zip`;
+      const kb = (blob.size / 1024).toFixed(0);
+      log(`导出：ZIP 就绪 ${kb} KB (${zipKind})，触发下载…`);
+
+      // 生成完归档 → 自动挂链接并触发 blob 下载；链接常驻面板，可反复点击重新下载。
+      // blob URL 尽量用页面 window 的 URL API 创建（TM 沙盒 URL 创建的 blob 页面点击下载可能失效）
+      const urlApi = (W && W.URL && W.URL.createObjectURL) ? W.URL : URL;
+      const dl = document.getElementById('dbb-dl');
+      if (dl) {
+        const url = urlApi.createObjectURL(blob);
+        if (dl.__url) { try { (dl.__urlObj || URL).revokeObjectURL(dl.__url); } catch (e) {} }   // 回收上一次的 blob
+        dl.__url = url;
+        dl.__urlObj = urlApi;
+        dl.href = url;
+        dl.download = fname;
+        dl.textContent = `⬇ ${fname} (${kb} KB，点击可重复下载)`;
+        dl.style.display = 'block';
+        dl.click();                                       // 自动生成即自动下载
+      } else {
+        const a = document.createElement('a');
+        a.href = urlApi.createObjectURL(blob);
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { try { urlApi.revokeObjectURL(a.href); } catch (e) {} a.remove(); }, 5000);
+      }
+      const sec = ((Date.now() - t0) / 1000).toFixed(1);
+      setStatus('已导出');
+      log(`已导出 ${fname}: ${files.length} 个会话 / ${msgTotal} 条消息 / ${kb} KB (${zipKind}, 耗时 ${sec}s)。` +
+          `若未自动下载，请点面板上的 ⬇ 链接手动下载`);
+    } catch (e) {
+      setStatus('导出失败');
+      log('导出失败: ' + (e && e.message ? e.message : e));
+      throw e;
+    } finally {
+      state.exporting = false;
+      if (exBtn) exBtn.disabled = false;
     }
-    const ts = new Date();
-    const pad = (x) => String(x).padStart(2, '0');
-    const fname = `doubao-history-${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.zip`;
-    const kb = (blob.size / 1024).toFixed(0);
-    // 生成完归档 → 自动挂链接并触发 blob 下载；链接常驻面板，可反复点击重新下载
-    const dl = document.getElementById('dbb-dl');
-    if (dl) {
-      const url = URL.createObjectURL(blob);
-      if (dl.__url) URL.revokeObjectURL(dl.__url);     // 回收上一次的 blob
-      dl.__url = url;
-      dl.href = url;
-      dl.download = fname;
-      dl.textContent = `⬇ ${fname} (${kb} KB，点击可重复下载)`;
-      dl.style.display = 'block';
-      dl.click();                                       // 自动生成即自动下载
-    } else {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = fname;
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
-    }
-    log(`已导出 ${fname}: ${files.length} 个会话 / ${msgTotal} 条消息 / ${kb} KB (${zipKind})`);
   }
 
   // ============================ UI ============================
@@ -910,10 +972,12 @@
       totalMsgs += n;
       const todo = needsSync(c);
       if (todo) pending++;
-      const cls = todo ? 'dbb-item pending' : 'dbb-item';
-      return `<div class="${cls}" title="ID: ${esc(c.id)}">
+      const budgeted = Number(c.fails || 0) >= MAX_CONV_FAILS && Number(c.update || 0) <= Number(c.failUpd || 0);
+      const cls = budgeted ? 'dbb-item failed' : todo ? 'dbb-item pending' : 'dbb-item';
+      const state2 = budgeted ? `⛔失败×${c.fails}（暂停）` : (n === 0 ? (todo ? '待抓' : '空') : n + ' 条');
+      return `<div class="${cls}" title="ID: ${esc(c.id)}${budgeted ? '\n连续失败 ' + c.fails + ' 次，已暂停重试；会话更新后自动恢复' : ''}">
         <span class="dbb-name">${esc(c.name || '会话_' + c.id)}</span>
-        <span class="dbb-meta">${n === 0 ? (todo ? '待抓' : '空') : n + ' 条'} · ${fmtDate(c.update)}</span>
+        <span class="dbb-meta">${state2} · ${fmtDate(c.update)}</span>
       </div>`;
     }).join('') || '<div class="dbb-empty">暂无历史，等待首次同步…</div>';
     if (stats) {
@@ -943,6 +1007,8 @@
         border-bottom:1px solid #232838;align-items:center}
       #dbb-panel .dbb-item:last-child{border-bottom:0}
       #dbb-panel .dbb-item.pending .dbb-name{color:#ffb86b}
+      #dbb-panel .dbb-item.failed .dbb-name{color:#ff8a8a}
+      #dbb-panel .dbb-item.failed .dbb-meta{color:#c76b6b}
       #dbb-panel .dbb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       #dbb-panel .dbb-meta{color:#7f8aa3;font-size:10px;white-space:nowrap}
       #dbb-panel .dbb-empty{padding:8px;color:#7f8aa3;text-align:center}

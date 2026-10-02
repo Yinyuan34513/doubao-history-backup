@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         豆包历史备份器
 // @namespace    https://github.com/Yinyuan34513/doubao-history-backup
-// @version      1.2.1
+// @version      1.2.2
 // @description  拦截豆包历史 API 并自动翻页刷新，IndexedDB 缓存增量同步（不重复抓已抓齐会话），导出 history/<会话名>/main.md ZIP
 // @author       Yinyuan34513
 // @match        https://doubao.com/*
@@ -20,8 +20,8 @@
   const LIST_LIMIT = 50;               // recent_conv 每页会话数
   const CHAIN_LIMIT = 20;              // chain/single 每页消息数
   const ANCHOR_MAX = 9007199254740991; // 初始 anchor_index (MAX_SAFE_INTEGER)
-  const CONV_DELAY = 150;              // 单个 worker 的会话间隔（防限流）
-  const MSG_CONCURRENCY = 3;           // 并发抓消息的 worker 数（提速 ~3x）
+  const CONV_DELAY = 6;              // 单个 worker 的会话间隔（防限流）
+  const MSG_CONCURRENCY = 90;          // 并发抓消息 worker 数（实测豆包不限流，直接拉满；要改数值就改这里）
 
   // 需要拦截/主动调用的历史相关 API（pathname 后缀匹配）
   const HISTORY_PATHS = [
@@ -864,13 +864,27 @@
     const ts = new Date();
     const pad = (x) => String(x).padStart(2, '0');
     const fname = `doubao-history-${ts.getFullYear()}${pad(ts.getMonth() + 1)}${pad(ts.getDate())}-${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.zip`;
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = fname;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
-    log(`已导出 ${fname}: ${files.length} 个会话 / ${msgTotal} 条消息 / ${(blob.size / 1024).toFixed(0)} KB (${zipKind})`);
+    const kb = (blob.size / 1024).toFixed(0);
+    // 生成完归档 → 自动挂链接并触发 blob 下载；链接常驻面板，可反复点击重新下载
+    const dl = document.getElementById('dbb-dl');
+    if (dl) {
+      const url = URL.createObjectURL(blob);
+      if (dl.__url) URL.revokeObjectURL(dl.__url);     // 回收上一次的 blob
+      dl.__url = url;
+      dl.href = url;
+      dl.download = fname;
+      dl.textContent = `⬇ ${fname} (${kb} KB，点击可重复下载)`;
+      dl.style.display = 'block';
+      dl.click();                                       // 自动生成即自动下载
+    } else {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 5000);
+    }
+    log(`已导出 ${fname}: ${files.length} 个会话 / ${msgTotal} 条消息 / ${kb} KB (${zipKind})`);
   }
 
   // ============================ UI ============================
@@ -932,6 +946,9 @@
       #dbb-panel .dbb-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
       #dbb-panel .dbb-meta{color:#7f8aa3;font-size:10px;white-space:nowrap}
       #dbb-panel .dbb-empty{padding:8px;color:#7f8aa3;text-align:center}
+      #dbb-panel a#dbb-dl{display:none;margin-top:6px;color:#8fd0ff;font-size:11px;text-decoration:none;
+        word-break:break-all;background:#171b26;border-radius:6px;padding:5px 8px}
+      #dbb-panel a#dbb-dl:hover{text-decoration:underline}
       #dbb-logbox{display:none;margin-top:8px;max-height:180px;overflow:auto;background:#141821;color:#a8d8a8;
         padding:6px;border-radius:6px;white-space:pre-wrap;word-break:break-all;font-size:10px;line-height:1.5}
     `);
@@ -946,6 +963,7 @@
         <button id="dbb-logbtn">日志</button>
       </div>
       <div id="dbb-list"><div class="dbb-empty">暂无历史，等待首次同步…</div></div>
+      <a id="dbb-dl" title="再次点击重新下载上次归档"></a>
       <pre id="dbb-logbox"></pre>`;
     document.body.appendChild(panel);
     document.getElementById('dbb-sync').onclick = () => runSync();
